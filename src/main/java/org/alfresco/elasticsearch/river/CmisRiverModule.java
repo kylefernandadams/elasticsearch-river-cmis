@@ -1,6 +1,5 @@
-package org.alfresco.elasticsearch.river.module;
+package org.alfresco.elasticsearch.river;
 
-import org.alfresco.elasticsearch.river.CmisRiver;
 import org.elasticsearch.common.inject.AbstractModule;
 import org.elasticsearch.river.River;
 

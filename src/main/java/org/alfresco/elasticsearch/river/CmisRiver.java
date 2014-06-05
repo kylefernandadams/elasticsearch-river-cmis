@@ -39,11 +39,7 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 	private final ThreadPool threadPool;
     private final Client client;
     
-    private String cmisUrl;
-    private String protocol = "http";
-    private String host = "localhost";
-    private String port = "8080";
-    private String versions = "1";
+    private String cmisUrl = "http://localhost:8080/alfresco/api/-default-/public/cmis/versions/1.1/atom";
     private String username = "admin";
     private String password = "admin";
     private String network = "-default-";
@@ -59,30 +55,21 @@ public class CmisRiver extends AbstractRiverComponent implements River{
     
     private Session session = null;
 
-    @Inject
-	@SuppressWarnings("unchecked")
-	protected CmisRiver(RiverName riverName, RiverSettings riverSettings, Client client, ThreadPool threadPool) {
+    @SuppressWarnings("unchecked")
+	@Inject
+    public CmisRiver(RiverName riverName, RiverSettings riverSettings, Client client, ThreadPool threadPool) {
 		super(riverName, riverSettings);
 		this.client = client;
         this.threadPool = threadPool;
 
-        if(riverSettings.settings().containsKey("alfresco")){
+        if(riverSettings.settings().containsKey("cmis")){
             Map<String, Object> alfrescoSettings = (Map<String, Object>) riverSettings.settings().get("alfresco");
             
             if(alfrescoSettings.containsKey("on-prem")){
                 Map<String, Object> onPremSettings = (Map<String, Object>) alfrescoSettings.get("on-prem");
                 
-                if(onPremSettings.containsKey("protocol")){
-                	protocol = XContentMapValues.nodeStringValue(onPremSettings.get("protocol"), protocol);
-                }
-                if(onPremSettings.containsKey("host")){
-                	host = XContentMapValues.nodeStringValue(onPremSettings.get("host"), host);
-                }
-                if(onPremSettings.containsKey("port")){
-                	port = XContentMapValues.nodeStringValue(onPremSettings.get("port"), port);
-                }
-                if(onPremSettings.containsKey("versions")){
-                	versions = XContentMapValues.nodeStringValue(onPremSettings.get("versions"), versions);
+                if(onPremSettings.containsKey("cmisUrl")){
+                	cmisUrl = XContentMapValues.nodeStringValue(onPremSettings.get("cmisUrl"), cmisUrl);
                 }
                 if(onPremSettings.containsKey("username")){
                 	username = XContentMapValues.nodeStringValue(onPremSettings.get("username"), username);
@@ -93,13 +80,8 @@ public class CmisRiver extends AbstractRiverComponent implements River{
                 if(onPremSettings.containsKey("cmisQuery")){
                 	cmisQuery = XContentMapValues.nodeStringValue(onPremSettings.get("cmisQuery"), cmisQuery);
                 }
-                cmisUrl = protocol + "://" + host + ":" + password + "/alfresco/api/-default-/public/cmis/versions/" + versions + "/atom";
             }
-            if(alfrescoSettings.containsKey("cloud")){
-            	Map<String, Object> oauth = (Map<String, Object>) alfrescoSettings.get("oauth");
-              
-            	cmisUrl = "";
-            }
+            
 			this.getCmisSession(username, password, cmisUrl);
         }
         
@@ -109,16 +91,16 @@ public class CmisRiver extends AbstractRiverComponent implements River{
             typeName = XContentMapValues.nodeStringValue(indexSettings.get("type"), "status");
             mapping = XContentMapValues.nodeStringValue(indexSettings.get("mapping"), mapping);
 
-            this.bulkSize = XContentMapValues.nodeIntegerValue(indexSettings.get("bulk_size"), 100);
-            this.bulkFlushInterval = TimeValue.parseTimeValue(XContentMapValues.nodeStringValue(
+            bulkSize = XContentMapValues.nodeIntegerValue(indexSettings.get("bulk_size"), 100);
+            bulkFlushInterval = TimeValue.parseTimeValue(XContentMapValues.nodeStringValue(
                     indexSettings.get("flush_interval"), "5s"), TimeValue.timeValueSeconds(5));
-            this.maxConcurrentBulk = XContentMapValues.nodeIntegerValue(indexSettings.get("max_concurrent_bulk"), 1);
+            maxConcurrentBulk = XContentMapValues.nodeIntegerValue(indexSettings.get("max_concurrent_bulk"), 1);
         } else {
             indexName = riverName.name();
             typeName = "status";
             bulkSize = 100;
-            this.maxConcurrentBulk = 1;
-            this.bulkFlushInterval = TimeValue.timeValueSeconds(5);
+            maxConcurrentBulk = 1;
+            bulkFlushInterval = TimeValue.timeValueSeconds(5);
         }
         
         this.bulkProcessor = BulkProcessor.builder(client, new BulkProcessor.Listener() {
@@ -141,6 +123,7 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 	}
 
 	public void start() {
+		logger.debug("Starting CmisRiver...");
 		if (!client.admin().indices().prepareExists(indexName).execute().actionGet().isExists()) {
 
             CreateIndexRequestBuilder createIndexRequest = client.admin().indices()
@@ -171,9 +154,7 @@ public class CmisRiver extends AbstractRiverComponent implements River{
                 indexRequest.source(source);
                 bulkProcessor.add(indexRequest);
                 
-                bulkProcessor.close();
-                logger.info("Import from CMIS repository complete");
-                
+                logger.info("Import from CMIS repository complete");                
 			}
 		}
 		catch(Exception e){
@@ -183,8 +164,7 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 	}
 	
 	public void close() {
-		// TODO Auto-generated method stub
-		
+		bulkProcessor.close();	
 	}
 	
 	public Session getCmisSession(String username, String password, String cmisUrl){
@@ -202,11 +182,11 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 	        List<Repository> repositories = factory.getRepositories(parameterMap);
 	        session = repositories.get(0).createSession();	        
 	        session.getDefaultContext().setCacheEnabled(false);
+	        logger.debug("Successfully retrieved session for repo: " + session.getRepositoryInfo().toString());
 		}
 		catch(Exception e){
 			logger.error("Failed to get Cmis Session", e);
 		}
 		return session;
 	}
-
 }
