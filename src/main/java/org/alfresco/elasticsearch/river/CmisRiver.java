@@ -22,6 +22,7 @@ import org.elasticsearch.action.bulk.BulkResponse;
 import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.client.Requests;
+import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.xcontent.support.XContentMapValues;
 import org.elasticsearch.river.AbstractRiverComponent;
@@ -58,7 +59,7 @@ public class CmisRiver extends AbstractRiverComponent implements River{
     
     private Session session = null;
 
-
+    @Inject
 	@SuppressWarnings("unchecked")
 	protected CmisRiver(RiverName riverName, RiverSettings riverSettings, Client client, ThreadPool threadPool) {
 		super(riverName, riverSettings);
