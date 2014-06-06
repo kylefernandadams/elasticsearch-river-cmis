@@ -1,6 +1,6 @@
-package org.alfresco.elasticsearch.river.plugin;
+package org.alfresco.elasticsearch.plugin.river.cmis;
 
-import org.alfresco.elasticsearch.river.CmisRiverModule;
+import org.alfresco.elasticsearch.river.cmis.CmisRiverModule;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.plugins.AbstractPlugin;
 import org.elasticsearch.river.RiversModule;
@@ -11,11 +11,11 @@ public class CmisRiverPlugin extends AbstractPlugin{
 	public CmisRiverPlugin(){
 	}
 	
-	public String description() {
+	public String name() {
 		return "river-cmis";
 	}
-
-	public String name() {
+	
+	public String description() {
 		return "Alfresco CMIS River Plugin";
 	}
 

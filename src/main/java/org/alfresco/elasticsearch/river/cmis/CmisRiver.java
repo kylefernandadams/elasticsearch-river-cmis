@@ -1,4 +1,4 @@
-package org.alfresco.elasticsearch.river;
+package org.alfresco.elasticsearch.river.cmis;
 
 import java.util.HashMap;
 import java.util.List;
@@ -15,16 +15,20 @@ import org.apache.chemistry.opencmis.client.runtime.SessionFactoryImpl;
 import org.apache.chemistry.opencmis.commons.PropertyIds;
 import org.apache.chemistry.opencmis.commons.SessionParameter;
 import org.apache.chemistry.opencmis.commons.enums.BindingType;
+import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.action.admin.indices.create.CreateIndexRequestBuilder;
+import org.elasticsearch.action.bulk.BulkItemResponse;
 import org.elasticsearch.action.bulk.BulkProcessor;
 import org.elasticsearch.action.bulk.BulkRequest;
 import org.elasticsearch.action.bulk.BulkResponse;
 import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.client.Requests;
+import org.elasticsearch.cluster.block.ClusterBlockException;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.xcontent.support.XContentMapValues;
+import org.elasticsearch.indices.IndexAlreadyExistsException;
 import org.elasticsearch.river.AbstractRiverComponent;
 import org.elasticsearch.river.River;
 import org.elasticsearch.river.RiverName;
@@ -61,7 +65,8 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 		super(riverName, riverSettings);
 		this.client = client;
         this.threadPool = threadPool;
-
+        
+        logger.debug("Instantiating CMIS River...");
         if(riverSettings.settings().containsKey("cmis")){
             Map<String, Object> alfrescoSettings = (Map<String, Object>) riverSettings.settings().get("alfresco");
             
@@ -85,8 +90,8 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 			this.getCmisSession(username, password, cmisUrl);
         }
         
-        if (settings.settings().containsKey("index")) {
-            Map<String, Object> indexSettings = (Map<String, Object>) settings.settings().get("index");
+        if (riverSettings.settings().containsKey("index")) {
+            Map<String, Object> indexSettings = (Map<String, Object>) riverSettings.settings().get("index");
             indexName = XContentMapValues.nodeStringValue(indexSettings.get("index"), riverName.name());
             typeName = XContentMapValues.nodeStringValue(indexSettings.get("type"), "status");
             mapping = XContentMapValues.nodeStringValue(indexSettings.get("mapping"), mapping);
@@ -110,6 +115,18 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 
             public void afterBulk(long executionId, BulkRequest request, BulkResponse response) {
                 logger.info("Executed bulk composed of {} actions", request.numberOfActions());
+                
+                if (response.hasFailures()) {
+                    logger.warn("There was failures while executing bulk", response.buildFailureMessage());
+                    if (logger.isDebugEnabled()) {
+                        for (BulkItemResponse item : response.getItems()) {
+                            if (item.isFailed()) {
+                                logger.debug("Error for {}/{}/{} for {} operation: {}", item.getIndex(),
+                                        item.getType(), item.getId(), item.getOpType(), item.getFailureMessage());
+                            }
+                        }
+                    }
+                }
             }
 
             public void afterBulk(long executionId, BulkRequest request, Throwable failure) {
@@ -124,20 +141,22 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 
 	public void start() {
 		logger.debug("Starting CmisRiver...");
-		if (!client.admin().indices().prepareExists(indexName).execute().actionGet().isExists()) {
 
-            CreateIndexRequestBuilder createIndexRequest = client.admin().indices()
-                    .prepareCreate(indexName);
-
-            if (settings != null) {
-                createIndexRequest.setSettings(settings);
+		try {
+			client.admin().indices().prepareCreate(indexName).execute().actionGet();
+		} 
+		catch (Exception e) {
+			if (ExceptionsHelper.unwrapCause(e) instanceof IndexAlreadyExistsException) {
+                // that's fine
+            } else if (ExceptionsHelper.unwrapCause(e) instanceof ClusterBlockException) {
+                // ok, not recovered yet..., lets start indexing and hope we recover by the first bulk
+                // TODO: a smarter logic can be to register for cluster event listener here, and only start sampling when the block is removed...
+            } else {
+                logger.warn("failed to create index [{}], disabling river...", e, indexName);
+                return;
             }
-            if (mapping != null) {
-                createIndexRequest.addMapping(typeName, mapping);
-            }
+		}
 
-            createIndexRequest.execute().actionGet();
-        }
 		
 		try{
 			ItemIterable<QueryResult> queryResults = session.query(cmisQuery, false);
@@ -158,12 +177,13 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 			}
 		}
 		catch(Exception e){
-			logger.error("Failed to start Cmis River", e);
+			logger.error("Failed to start CMIS River", e);
 			bulkProcessor.close();
 		}
 	}
 	
 	public void close() {
+		logger.debug("Closing CMIS River...");
 		bulkProcessor.close();	
 	}
 	
