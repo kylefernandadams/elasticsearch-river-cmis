@@ -1,12 +1,13 @@
 package org.alfresco.elasticsearch.river.cmis;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-import org.apache.chemistry.opencmis.client.api.Document;
+import org.alfresco.elasticsearch.river.cmis.entity.CmisObject;
+import org.alfresco.elasticsearch.river.cmis.entity.CmisProperty;
 import org.apache.chemistry.opencmis.client.api.ItemIterable;
-import org.apache.chemistry.opencmis.client.api.Property;
 import org.apache.chemistry.opencmis.client.api.QueryResult;
 import org.apache.chemistry.opencmis.client.api.Repository;
 import org.apache.chemistry.opencmis.client.api.Session;
@@ -14,9 +15,9 @@ import org.apache.chemistry.opencmis.client.api.SessionFactory;
 import org.apache.chemistry.opencmis.client.runtime.SessionFactoryImpl;
 import org.apache.chemistry.opencmis.commons.PropertyIds;
 import org.apache.chemistry.opencmis.commons.SessionParameter;
+import org.apache.chemistry.opencmis.commons.data.PropertyData;
 import org.apache.chemistry.opencmis.commons.enums.BindingType;
 import org.elasticsearch.ExceptionsHelper;
-import org.elasticsearch.action.admin.indices.create.CreateIndexRequestBuilder;
 import org.elasticsearch.action.bulk.BulkItemResponse;
 import org.elasticsearch.action.bulk.BulkProcessor;
 import org.elasticsearch.action.bulk.BulkRequest;
@@ -27,6 +28,7 @@ import org.elasticsearch.client.Requests;
 import org.elasticsearch.cluster.block.ClusterBlockException;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.common.xcontent.XContentFactory;
 import org.elasticsearch.common.xcontent.support.XContentMapValues;
 import org.elasticsearch.indices.IndexAlreadyExistsException;
 import org.elasticsearch.river.AbstractRiverComponent;
@@ -35,8 +37,8 @@ import org.elasticsearch.river.RiverName;
 import org.elasticsearch.river.RiverSettings;
 import org.elasticsearch.threadpool.ThreadPool;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 
 public class CmisRiver extends AbstractRiverComponent implements River{
 	
@@ -46,7 +48,6 @@ public class CmisRiver extends AbstractRiverComponent implements River{
     private String cmisUrl = "http://localhost:8080/alfresco/api/-default-/public/cmis/versions/1.1/atom";
     private String username = "admin";
     private String password = "admin";
-    private String network = "-default-";
     private String cmisQuery = "SELECT * FROM cmis:document";
     
     private final String indexName;
@@ -57,8 +58,6 @@ public class CmisRiver extends AbstractRiverComponent implements River{
     private final TimeValue bulkFlushInterval;
     private volatile BulkProcessor bulkProcessor;
     
-    private Session session = null;
-
     @SuppressWarnings("unchecked")
 	@Inject
     public CmisRiver(RiverName riverName, RiverSettings riverSettings, Client client, ThreadPool threadPool) {
@@ -86,14 +85,12 @@ public class CmisRiver extends AbstractRiverComponent implements River{
                 	cmisQuery = XContentMapValues.nodeStringValue(onPremSettings.get("cmisQuery"), cmisQuery);
                 }
             }
-            
-			this.getCmisSession(username, password, cmisUrl);
         }
         
         if (riverSettings.settings().containsKey("index")) {
             Map<String, Object> indexSettings = (Map<String, Object>) riverSettings.settings().get("index");
             indexName = XContentMapValues.nodeStringValue(indexSettings.get("index"), riverName.name());
-            typeName = XContentMapValues.nodeStringValue(indexSettings.get("type"), "status");
+            typeName = XContentMapValues.nodeStringValue(indexSettings.get("type"), "cmisObject");
             mapping = XContentMapValues.nodeStringValue(indexSettings.get("mapping"), mapping);
 
             bulkSize = XContentMapValues.nodeIntegerValue(indexSettings.get("bulk_size"), 100);
@@ -102,7 +99,7 @@ public class CmisRiver extends AbstractRiverComponent implements River{
             maxConcurrentBulk = XContentMapValues.nodeIntegerValue(indexSettings.get("max_concurrent_bulk"), 1);
         } else {
             indexName = riverName.name();
-            typeName = "status";
+            typeName = "cmisObject";
             bulkSize = 100;
             maxConcurrentBulk = 1;
             bulkFlushInterval = TimeValue.timeValueSeconds(5);
@@ -143,7 +140,12 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 		logger.debug("Starting CmisRiver...");
 
 		try {
-			client.admin().indices().prepareCreate(indexName).execute().actionGet();
+			String mapping = XContentFactory.jsonBuilder().startObject()
+                    .startObject("values").field("type", "string").endObject()
+                    .endObject().string();
+			
+			logger.debug("Mapping: " + mapping);
+			client.admin().indices().prepareCreate(indexName).addMapping("source", mapping).execute().actionGet();
 		} 
 		catch (Exception e) {
 			if (ExceptionsHelper.unwrapCause(e) instanceof IndexAlreadyExistsException) {
@@ -159,21 +161,31 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 
 		
 		try{
+			Session session = this.getCmisSession(username, password, cmisUrl);
 			ItemIterable<QueryResult> queryResults = session.query(cmisQuery, false);
 			for (QueryResult queryResult : queryResults) {
-				String objectId = String.valueOf(queryResult.getPropertyById(PropertyIds.OBJECT_ID).getValues().get(0));
-				Document document = (Document) session.getObject(session.createObjectId(objectId));
+				CmisObject cmisObject = new CmisObject();
+				cmisObject.setObjectId(String.valueOf(queryResult.getPropertyById("alfcmis:nodeRef").getValues().get(0)));
+				cmisObject.setPropertyData(queryResult.getProperties());
 				
-				List<Property<?>> propertyList = document.getProperties();
-				Gson gson = new GsonBuilder().setPrettyPrinting().create();
+				List<CmisProperty> cmisProperties = new ArrayList<CmisProperty>();
+				for(PropertyData<?> propertyData : queryResult.getProperties()){
+					CmisProperty cmisProperty = new CmisProperty();
+					cmisProperty.setId(propertyData.getId());
+					cmisProperty.setName(propertyData.getDisplayName());
+					cmisProperty.setValues(propertyData.getValues());
+					cmisProperties.add(cmisProperty);
+				}
+//				cmisObject.setPropertyList(cmisProperties);
 				
-				IndexRequest indexRequest = Requests.indexRequest(indexName).type(typeName).id(document.getId());
-                String source = gson.toJson(propertyList);
-                
-                indexRequest.source(source);
+				ObjectMapper objectMapper = new ObjectMapper();
+		        objectMapper.configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false);
+				
+				IndexRequest indexRequest = Requests.indexRequest(indexName).type(typeName).id(cmisObject.getObjectId());
+                indexRequest.source(objectMapper.writeValueAsString(cmisObject));
                 bulkProcessor.add(indexRequest);
                 
-                logger.info("Import from CMIS repository complete");                
+//                logger.info("Import from CMIS repository complete");                
 			}
 		}
 		catch(Exception e){
@@ -188,7 +200,7 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 	}
 	
 	public Session getCmisSession(String username, String password, String cmisUrl){
-		
+		Session session = null;
 		try{
 			// create a session
 	        SessionFactory factory = SessionFactoryImpl.newInstance();
@@ -202,7 +214,7 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 	        List<Repository> repositories = factory.getRepositories(parameterMap);
 	        session = repositories.get(0).createSession();	        
 	        session.getDefaultContext().setCacheEnabled(false);
-	        logger.debug("Successfully retrieved session for repo: " + session.getRepositoryInfo().toString());
+//	        logger.debug("Successfully retrieved session for repo: " + session.getRepositoryInfo().toString());
 		}
 		catch(Exception e){
 			logger.error("Failed to get Cmis Session", e);
