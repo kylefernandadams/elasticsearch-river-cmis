@@ -1,19 +1,16 @@
 package org.alfresco.elasticsearch.river.cmis;
 
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 import org.alfresco.elasticsearch.river.cmis.entity.CmisObject;
-import org.alfresco.elasticsearch.river.cmis.entity.CmisProperty;
 import org.apache.chemistry.opencmis.client.api.ItemIterable;
 import org.apache.chemistry.opencmis.client.api.QueryResult;
 import org.apache.chemistry.opencmis.client.api.Repository;
 import org.apache.chemistry.opencmis.client.api.Session;
 import org.apache.chemistry.opencmis.client.api.SessionFactory;
 import org.apache.chemistry.opencmis.client.runtime.SessionFactoryImpl;
-import org.apache.chemistry.opencmis.commons.PropertyIds;
 import org.apache.chemistry.opencmis.commons.SessionParameter;
 import org.apache.chemistry.opencmis.commons.data.PropertyData;
 import org.apache.chemistry.opencmis.commons.enums.BindingType;
@@ -28,7 +25,6 @@ import org.elasticsearch.client.Requests;
 import org.elasticsearch.cluster.block.ClusterBlockException;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.unit.TimeValue;
-import org.elasticsearch.common.xcontent.XContentFactory;
 import org.elasticsearch.common.xcontent.support.XContentMapValues;
 import org.elasticsearch.indices.IndexAlreadyExistsException;
 import org.elasticsearch.river.AbstractRiverComponent;
@@ -52,8 +48,10 @@ public class CmisRiver extends AbstractRiverComponent implements River{
     
     private final String indexName;
     private final String typeName;
-    private String mapping = null;
     private final int bulkSize;
+    private final TimeValue bulkTimeout;
+    private final int throttleSize;
+    
     private final int maxConcurrentBulk;
     private final TimeValue bulkFlushInterval;
     private volatile BulkProcessor bulkProcessor;
@@ -65,7 +63,6 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 		this.client = client;
         this.threadPool = threadPool;
         
-        logger.debug("Instantiating CMIS River...");
         if(riverSettings.settings().containsKey("cmis")){
             Map<String, Object> alfrescoSettings = (Map<String, Object>) riverSettings.settings().get("alfresco");
             
@@ -91,21 +88,49 @@ public class CmisRiver extends AbstractRiverComponent implements River{
             Map<String, Object> indexSettings = (Map<String, Object>) riverSettings.settings().get("index");
             indexName = XContentMapValues.nodeStringValue(indexSettings.get("index"), riverName.name());
             typeName = XContentMapValues.nodeStringValue(indexSettings.get("type"), "cmisObject");
-            mapping = XContentMapValues.nodeStringValue(indexSettings.get("mapping"), mapping);
 
             bulkSize = XContentMapValues.nodeIntegerValue(indexSettings.get("bulk_size"), 100);
+            if (indexSettings.containsKey("bulk_timeout")) {
+                bulkTimeout = TimeValue.parseTimeValue(XContentMapValues.nodeStringValue(indexSettings.get("bulk_timeout"), "10ms"), TimeValue.timeValueMillis(10));
+            } else {
+                bulkTimeout = TimeValue.timeValueMillis(10);
+            }
             bulkFlushInterval = TimeValue.parseTimeValue(XContentMapValues.nodeStringValue(
                     indexSettings.get("flush_interval"), "5s"), TimeValue.timeValueSeconds(5));
             maxConcurrentBulk = XContentMapValues.nodeIntegerValue(indexSettings.get("max_concurrent_bulk"), 1);
+            throttleSize = XContentMapValues.nodeIntegerValue(indexSettings.get("throttle_size"), bulkSize * 5);
+
         } else {
             indexName = riverName.name();
             typeName = "cmisObject";
             bulkSize = 100;
+            bulkTimeout = TimeValue.timeValueMillis(10);
+            throttleSize = bulkSize * 5;
             maxConcurrentBulk = 1;
             bulkFlushInterval = TimeValue.timeValueSeconds(5);
         }
-        
-        this.bulkProcessor = BulkProcessor.builder(client, new BulkProcessor.Listener() {
+	}
+
+	public void start() {
+		logger.debug("Starting CmisRiver in Index:[{}/{}] with Cmis Parameters: Cmis Url:[{}], Cmis Query:[{}]", indexName, typeName, cmisUrl, cmisQuery);
+		try {
+            client.admin().indices().prepareCreate(indexName).execute().actionGet();
+        } 
+		catch (Exception e) {
+            if (ExceptionsHelper.unwrapCause(e) instanceof IndexAlreadyExistsException) {
+                // that's fine
+            } else if (ExceptionsHelper.unwrapCause(e) instanceof ClusterBlockException) {
+                // ok, not recovered yet..., lets start indexing and hope we recover by the first bulk
+                // TODO: a smarter logic can be to register for cluster event listener here, and only start sampling when the block is removed...
+            } else {
+                logger.warn("failed to create index [{}], disabling river...", e, indexName);
+                return;
+            }
+        }
+		
+		
+		// Create bulk processor
+		this.bulkProcessor = BulkProcessor.builder(client, new BulkProcessor.Listener() {
             public void beforeBulk(long executionId, BulkRequest request) {
                 logger.info("Going to execute new bulk composed of {} actions", request.numberOfActions());
             }
@@ -134,58 +159,39 @@ public class CmisRiver extends AbstractRiverComponent implements River{
         .setConcurrentRequests(maxConcurrentBulk)
         .setFlushInterval(bulkFlushInterval)
         .build();
-	}
-
-	public void start() {
-		logger.debug("Starting CmisRiver...");
-
-		try {
-			String mapping = XContentFactory.jsonBuilder().startObject()
-                    .startObject("values").field("type", "string").endObject()
-                    .endObject().string();
-			
-			logger.debug("Mapping: " + mapping);
-			client.admin().indices().prepareCreate(indexName).addMapping("source", mapping).execute().actionGet();
-		} 
-		catch (Exception e) {
-			if (ExceptionsHelper.unwrapCause(e) instanceof IndexAlreadyExistsException) {
-                // that's fine
-            } else if (ExceptionsHelper.unwrapCause(e) instanceof ClusterBlockException) {
-                // ok, not recovered yet..., lets start indexing and hope we recover by the first bulk
-                // TODO: a smarter logic can be to register for cluster event listener here, and only start sampling when the block is removed...
-            } else {
-                logger.warn("failed to create index [{}], disabling river...", e, indexName);
-                return;
-            }
-		}
-
 		
+		startCmisQuery();
+	}
+	
+	public void close() {
+		logger.debug("Closing CMIS River...");
+		bulkProcessor.close();	
+	}
+	
+	private void startCmisQuery(){
 		try{
 			Session session = this.getCmisSession(username, password, cmisUrl);
 			ItemIterable<QueryResult> queryResults = session.query(cmisQuery, false);
 			for (QueryResult queryResult : queryResults) {
 				CmisObject cmisObject = new CmisObject();
-				cmisObject.setObjectId(String.valueOf(queryResult.getPropertyById("alfcmis:nodeRef").getValues().get(0)));
-				cmisObject.setPropertyData(queryResult.getProperties());
-				
-				List<CmisProperty> cmisProperties = new ArrayList<CmisProperty>();
+
+				Map<String, List<?>> propertyMap = new HashMap<String, List<?>>();
 				for(PropertyData<?> propertyData : queryResult.getProperties()){
-					CmisProperty cmisProperty = new CmisProperty();
-					cmisProperty.setId(propertyData.getId());
-					cmisProperty.setName(propertyData.getDisplayName());
-					cmisProperty.setValues(propertyData.getValues());
-					cmisProperties.add(cmisProperty);
+					propertyMap.put(propertyData.getId(), propertyData.getValues());
 				}
-//				cmisObject.setPropertyList(cmisProperties);
+				cmisObject.setPropertyMap(propertyMap);
 				
 				ObjectMapper objectMapper = new ObjectMapper();
 		        objectMapper.configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false);
 				
-				IndexRequest indexRequest = Requests.indexRequest(indexName).type(typeName).id(cmisObject.getObjectId());
+		        logger.debug("JSON: " + objectMapper.writeValueAsString(cmisObject));
+		        
+				IndexRequest indexRequest = Requests.
+						indexRequest(indexName).
+						type(typeName).
+						id(cmisObject.getPropertyMap().get("alfcmis:nodeRef").toString());
                 indexRequest.source(objectMapper.writeValueAsString(cmisObject));
-                bulkProcessor.add(indexRequest);
-                
-//                logger.info("Import from CMIS repository complete");                
+                bulkProcessor.add(indexRequest);                
 			}
 		}
 		catch(Exception e){
@@ -194,12 +200,7 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 		}
 	}
 	
-	public void close() {
-		logger.debug("Closing CMIS River...");
-		bulkProcessor.close();	
-	}
-	
-	public Session getCmisSession(String username, String password, String cmisUrl){
+	private Session getCmisSession(String username, String password, String cmisUrl){
 		Session session = null;
 		try{
 			// create a session
@@ -210,6 +211,7 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 	        parameterMap.put(SessionParameter.ATOMPUB_URL, cmisUrl);
 	        parameterMap.put(SessionParameter.BINDING_TYPE,
 	                BindingType.ATOMPUB.value());
+	        
 	        // Use the first repository
 	        List<Repository> repositories = factory.getRepositories(parameterMap);
 	        session = repositories.get(0).createSession();	        
