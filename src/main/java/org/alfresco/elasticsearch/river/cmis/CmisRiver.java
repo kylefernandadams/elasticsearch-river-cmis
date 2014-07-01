@@ -172,27 +172,43 @@ public class CmisRiver extends AbstractRiverComponent implements River{
 		try{
 			Session session = this.getCmisSession(username, password, cmisUrl);
 			ItemIterable<QueryResult> queryResults = session.query(cmisQuery, false);
-			for (QueryResult queryResult : queryResults) {
-				CmisObject cmisObject = new CmisObject();
-
-				Map<String, List<?>> propertyMap = new HashMap<String, List<?>>();
-				for(PropertyData<?> propertyData : queryResult.getProperties()){
-					propertyMap.put(propertyData.getId(), propertyData.getValues());
-				}
-				cmisObject.setPropertyMap(propertyMap);
-				
-				ObjectMapper objectMapper = new ObjectMapper();
-		        objectMapper.configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false);
-				
-		        logger.debug("JSON: " + objectMapper.writeValueAsString(cmisObject));
+			int pageNumber = 0;
+		    boolean finished = false;
+		    int count= 0;
+		    while (!finished) {
+		        ItemIterable<QueryResult> currentPage = queryResults.skipTo(count).getPage();
+		        logger.debug("Found Page: " + (pageNumber + 1)+ " with number of results: " + currentPage.getPageNumItems());
 		        
-				IndexRequest indexRequest = Requests.
-						indexRequest(indexName).
-						type(typeName).
-						id(cmisObject.getPropertyMap().get("alfcmis:nodeRef").toString());
-                indexRequest.source(objectMapper.writeValueAsString(cmisObject));
-                bulkProcessor.add(indexRequest);                
-			}
+		        for (QueryResult queryResult: currentPage) {
+		        	logger.debug("Found Document: " + (count + 1) +  " with name: " + queryResult.getPropertyValueByQueryName("cmis:name"));
+		            CmisObject cmisObject = new CmisObject();
+
+					Map<String, List<?>> propertyMap = new HashMap<String, List<?>>();
+					for(PropertyData<?> propertyData : queryResult.getProperties()){
+						propertyMap.put(propertyData.getId(), propertyData.getValues());
+					}
+					cmisObject.setPropertyMap(propertyMap);
+					
+					ObjectMapper objectMapper = new ObjectMapper();
+			        objectMapper.configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false);
+					
+			        logger.debug("JSON: " + objectMapper.writeValueAsString(cmisObject));
+			        
+					IndexRequest indexRequest = Requests.
+							indexRequest(indexName).
+							type(typeName).
+							id(cmisObject.getPropertyMap().get("alfcmis:nodeRef").toString());
+	                indexRequest.source(objectMapper.writeValueAsString(cmisObject));
+	                bulkProcessor.add(indexRequest);    
+		            
+		            count++;
+		        }
+		        pageNumber++;
+		        if (!currentPage.getHasMoreItems())
+		            finished = true;
+		    }
+		    logger.debug("Total Pages: " + pageNumber);
+		    logger.debug("Total Count: " + count);
 		}
 		catch(Exception e){
 			logger.error("Failed to start CMIS River", e);
